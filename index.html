@@ -112,23 +112,6 @@
     let hasBeenBanned = false;
     let genderMismatchCount = 0;
 
-    // --- DB ERROR LOGGING PIPELINE ---
-    function logErrorToDB(source, message, details = "") {
-        fetch('/api/log_error', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ source: source, message: String(message), details: String(details) })
-        }).catch(e => console.error(e));
-    }
-
-    window.onerror = function(message, source, lineno, colno, error) {
-        logErrorToDB("frontend_window", message, error ? error.stack : "");
-    };
-
-    window.onunhandledrejection = function(event) {
-        logErrorToDB("frontend_promise", event.reason, "");
-    };
-
     document.addEventListener('contextmenu', event => event.preventDefault());
 
     function enforceSecurityTermination() {
@@ -155,9 +138,7 @@
             const response = await fetch('/api/ad');
             const data = await response.json();
             document.getElementById('adContainer').innerHTML = data.ad_content;
-        } catch (err) {
-            logErrorToDB("fetchAd", err.message, err.stack);
-        }
+        } catch (err) {}
     }
     fetchAd();
 
@@ -190,25 +171,19 @@
             document.getElementById('localVideo').srcObject = localStream;
             startGlobalMonitor();
         } catch (err) {
-            logErrorToDB("initWebcam", err.message, err.stack);
             alert("Webcam & Microphone access are required.");
         }
     }
     initWebcam();
 
     function captureSnapshot(targetWidth = 320) {
-        try {
-            const video = document.getElementById('localVideo');
-            const canvas = document.getElementById('canvas');
-            const scale = video.videoWidth ? (targetWidth / video.videoWidth) : 1;
-            canvas.width = targetWidth;
-            canvas.height = video.videoHeight ? (video.videoHeight * scale) : (targetWidth * 0.75);
-            canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-            return canvas.toDataURL('image/jpeg', 0.7);
-        } catch (err) {
-            logErrorToDB("captureSnapshot", err.message, err.stack);
-            return "";
-        }
+        const video = document.getElementById('localVideo');
+        const canvas = document.getElementById('canvas');
+        const scale = video.videoWidth ? (targetWidth / video.videoWidth) : 1;
+        canvas.width = targetWidth;
+        canvas.height = video.videoHeight ? (video.videoHeight * scale) : (targetWidth * 0.75);
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+        return canvas.toDataURL('image/jpeg', 0.7);
     }
 
     function showToastWarning(msg) {
@@ -231,7 +206,7 @@
             turnOffAutoMatch();
             closePeerConnection();
             alert("Auto-Match stopped: Gender mismatch detected 5 times.");
-            genderMismatchCount = 0; 
+            genderMismatchCount = 0; // Reset after stopping
         }
     }
 
@@ -252,28 +227,20 @@
         };
 
         monitorWs.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (data.type === 'error') {
-                    hasBeenBanned = true;
-                    turnOffAutoMatch();
-                    alert(data.payload);
-                    location.reload(); 
-                } else if (data.type === 'warning') {
-                    showToastWarning(data.payload);
-                } else if (data.type === 'gender_mismatch') {
-                    handleGenderMismatch(data.payload);
-                } else if (data.type === 'ai_status') {
-                    const aiLabel = document.getElementById('aiStatusLabel');
-                    if (aiLabel) aiLabel.textContent = data.payload;
-                }
-            } catch (err) {
-                logErrorToDB("monitorWs_onmessage", err.message, event.data);
+            const data = JSON.parse(event.data);
+            if (data.type === 'error') {
+                hasBeenBanned = true;
+                turnOffAutoMatch();
+                alert(data.payload);
+                location.reload(); 
+            } else if (data.type === 'warning') {
+                showToastWarning(data.payload);
+            } else if (data.type === 'gender_mismatch') {
+                handleGenderMismatch(data.payload);
+            } else if (data.type === 'ai_status') {
+                const aiLabel = document.getElementById('aiStatusLabel');
+                if (aiLabel) aiLabel.textContent = data.payload;
             }
-        };
-
-        monitorWs.onerror = (err) => {
-            logErrorToDB("monitorWs_onerror", "Monitor WS Error", err);
         };
 
         monitorWs.onclose = () => {
@@ -295,7 +262,7 @@
         isAutoMatching = false;
         const btn = document.getElementById('autoMatchBtn');
         btn.textContent = "Start Auto-Match";
-        btn.style.backgroundColor = "#28a745"; 
+        btn.style.backgroundColor = "#28a745"; // Green
     }
 
     function toggleAutoMatch() {
@@ -314,7 +281,7 @@
         
         if (isAutoMatching) {
             btn.textContent = "Stop Auto-Match";
-            btn.style.backgroundColor = "#dc3545"; 
+            btn.style.backgroundColor = "#dc3545"; // Red
             findNextStranger();
         } else {
             turnOffAutoMatch();
@@ -350,58 +317,50 @@
         };
 
         ws.onmessage = async (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (data.type === 'status') {
-                    appendMessage(data.payload, "system");
-                } else if (data.type === 'match_start') {
-                    appendMessage(`Matched with a ${data.partner_gender}! Connecting video...`, "system");
-                    document.getElementById('remoteLabel').textContent = `Stranger (${data.partner_gender})`;
-                    document.getElementById('msgInput').disabled = false;
-                    document.getElementById('sendBtn').disabled = false;
-                    document.getElementById('reportBtn').disabled = false;
-                    setupWebRTC(data.role === 'initiator');
-                } else if (data.type === 'offer') {
-                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
-                    const answer = await peerConnection.createAnswer();
-                    await peerConnection.setLocalDescription(answer);
-                    ws.send(JSON.stringify({ type: 'answer', answer }));
-                } else if (data.type === 'answer') {
-                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-                } else if (data.type === 'candidate') {
-                    if (peerConnection && data.candidate) await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-                } else if (data.type === 'message') {
-                    appendMessage(data.payload, "stranger");
-                } else if (data.type === 'warning') {
-                    showToastWarning(data.payload);
-                } else if (data.type === 'gender_mismatch') {
-                    handleGenderMismatch(data.payload);
-                } else if (data.type === 'peer_disconnected') {
-                    appendMessage("Stranger has disconnected.", "system");
-                    if (isAutoMatching) {
-                        appendMessage("Finding next stranger...", "system");
-                        setTimeout(findNextStranger, 1500);
-                    } else {
-                        closePeerConnection();
-                    }
-                } else if (data.type === 'error' || data.type === 'system') {
-                    appendMessage(data.payload, "system");
-                    if (data.type === 'error') {
-                        if (data.payload.includes("Banned")) {
-                            hasBeenBanned = true;
-                            turnOffAutoMatch();
-                        }
-                        closePeerConnection();
-                    }
+            const data = JSON.parse(event.data);
+            if (data.type === 'status') {
+                appendMessage(data.payload, "system");
+            } else if (data.type === 'match_start') {
+                appendMessage(`Matched with a ${data.partner_gender}! Connecting video...`, "system");
+                document.getElementById('remoteLabel').textContent = `Stranger (${data.partner_gender})`;
+                document.getElementById('msgInput').disabled = false;
+                document.getElementById('sendBtn').disabled = false;
+                document.getElementById('reportBtn').disabled = false;
+                setupWebRTC(data.role === 'initiator');
+            } else if (data.type === 'offer') {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                ws.send(JSON.stringify({ type: 'answer', answer }));
+            } else if (data.type === 'answer') {
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+            } else if (data.type === 'candidate') {
+                if (peerConnection && data.candidate) await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+            } else if (data.type === 'message') {
+                appendMessage(data.payload, "stranger");
+            } else if (data.type === 'warning') {
+                showToastWarning(data.payload);
+            } else if (data.type === 'gender_mismatch') {
+                handleGenderMismatch(data.payload);
+            } else if (data.type === 'peer_disconnected') {
+                appendMessage("Stranger has disconnected.", "system");
+                if (isAutoMatching) {
+                    appendMessage("Finding next stranger...", "system");
+                    setTimeout(findNextStranger, 1500);
+                } else {
+                    closePeerConnection();
                 }
-            } catch (err) {
-                logErrorToDB("chatWs_onmessage", err.message, event.data);
+            } else if (data.type === 'error' || data.type === 'system') {
+                appendMessage(data.payload, "system");
+                if (data.type === 'error') {
+                    if (data.payload.includes("Banned")) {
+                        hasBeenBanned = true;
+                        turnOffAutoMatch();
+                    }
+                    closePeerConnection();
+                }
             }
         };
-
-        ws.onerror = (err) => {
-            logErrorToDB("chatWs_onerror", "Chat WebSocket Error", err);
-        }
 
         ws.onclose = () => {
             closePeerConnection();
@@ -409,50 +368,38 @@
     }
 
     function setupWebRTC(isInitiator) {
-        try {
-            peerConnection = new RTCPeerConnection(rtcConfig);
-            localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+        peerConnection = new RTCPeerConnection(rtcConfig);
+        localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
 
-            peerConnection.ontrack = (event) => { document.getElementById('remoteVideo').srcObject = event.streams[0]; };
-            peerConnection.onicecandidate = (event) => {
-                if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
-                }
-            };
-
-            if (isInitiator) {
-                peerConnection.onnegotiationneeded = async () => {
-                    const offer = await peerConnection.createOffer();
-                    await peerConnection.setLocalDescription(offer);
-                    ws.send(JSON.stringify({ type: 'offer', offer }));
-                };
+        peerConnection.ontrack = (event) => { document.getElementById('remoteVideo').srcObject = event.streams[0]; };
+        peerConnection.onicecandidate = (event) => {
+            if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
             }
-        } catch (err) {
-            logErrorToDB("setupWebRTC", err.message, err.stack);
+        };
+
+        if (isInitiator) {
+            peerConnection.onnegotiationneeded = async () => {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                ws.send(JSON.stringify({ type: 'offer', offer }));
+            };
         }
     }
 
     function sendMessage() {
-        try {
-            const input = document.getElementById('msgInput');
-            const message = input.value.trim();
-            if (message && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'text', payload: message }));
-                appendMessage(message, "you");
-                input.value = '';
-            }
-        } catch (err) {
-            logErrorToDB("sendMessage", err.message, err.stack);
+        const input = document.getElementById('msgInput');
+        const message = input.value.trim();
+        if (message && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'text', payload: message }));
+            appendMessage(message, "you");
+            input.value = '';
         }
     }
 
     function reportUser() {
-        try {
-            if (ws && ws.readyState === WebSocket.OPEN && confirm("Are you sure you want to report this user? This will ban them.")) {
-                ws.send(JSON.stringify({ type: 'report' }));
-            }
-        } catch (err) {
-            logErrorToDB("reportUser", err.message, err.stack);
+        if (ws && ws.readyState === WebSocket.OPEN && confirm("Are you sure you want to report this user? This will ban them.")) {
+            ws.send(JSON.stringify({ type: 'report' }));
         }
     }
 
