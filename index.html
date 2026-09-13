@@ -327,6 +327,8 @@
         const gender = document.getElementById('genderSelect').value;
         const chatBox = document.getElementById('chatBox');
         chatBox.innerHTML = '';
+        
+        document.getElementById('remoteLabel').textContent = "Searching for match...";
         appendMessage("Verifying AI safety protocols...", "system");
 
         const snapshot = captureSnapshot(320);

@@ -11,6 +11,7 @@ import asyncpg
 import asyncio
 import gc
 from typing import Dict, List
+from collections import deque, Counter
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import HTMLResponse
 
@@ -28,7 +29,7 @@ DB_URL = os.getenv("DATABASE_URL", postgres_url)
 db_pool = None
 ai_task_queue = asyncio.Queue()
 workers = []
-ai_semaphore = asyncio.Semaphore(1)
+ai_semaphore = asyncio.Semaphore(4)
 
 FACE_PROTO, FACE_MODEL = "deploy.prototxt", "res10_300x300_ssd_iter_140000.caffemodel"
 GENDER_PROTO, GENDER_MODEL = "gender_deploy.prototxt", "gender_net.caffemodel"
@@ -59,6 +60,7 @@ for net in [face_net, gender_net, age_net]:
 waiting_males, waiting_females = [], []
 active_rooms, user_rooms, client_ips = {}, {}, {}
 monitor_connections = set()
+client_history: Dict[str, Dict[str, deque]] = {}
 SCAM_WORDS = ["crypto", "invest", "cashapp", "venmo", "telegram", "whatsapp", "paypal", "bitcoin", "scam", "hack"]
 
 def get_active_user_count():
@@ -70,16 +72,12 @@ async def broadcast_active_count():
     payload = {"type": "active_users", "count": count}
     
     for ws in list(monitor_connections):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            pass
+        try: await ws.send_json(payload)
+        except Exception: pass
             
     for ws in list(client_ips.keys()):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            pass
+        try: await ws.send_json(payload)
+        except Exception: pass
 
 def decode_base64_image(base64_str: str):
     try:
@@ -87,8 +85,7 @@ def decode_base64_image(base64_str: str):
             base64_str = base64_str.split(",")[1]
         np_arr = np.frombuffer(base64.b64decode(base64_str), np.uint8)
         return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    except Exception:
-        return None
+    except Exception: return None
 
 def compress_image_b64(img):
     if img is None: return None
@@ -98,9 +95,16 @@ def compress_image_b64(img):
         return base64.b64encode(buffer).decode('utf-8')
     except Exception: return None
 
-def analyze_frame(img, user_gender):
+def analyze_frame(img, user_gender, fast_mode=False):
     if img is None: return False, False, False, "unknown"
     try:
+        h_orig, w_orig = img.shape[:2]
+        target_w = 150 if fast_mode else 400
+        
+        if w_orig > target_w:
+            scale = target_w / w_orig
+            img = cv2.resize(img, (target_w, int(h_orig * scale)))
+            
         global face_net, gender_net, age_net
         h, w = img.shape[:2]
         
@@ -112,9 +116,11 @@ def analyze_frame(img, user_gender):
         best_box = None
         max_conf = 0
         
+        face_thresh = 0.35 if fast_mode else 0.45
+        
         for i in range(detections.shape[2]):
             conf = detections[0, 0, i, 2]
-            if conf > 0.60 and conf > max_conf: 
+            if conf > face_thresh and conf > max_conf: 
                 max_conf = conf
                 best_box = (detections[0, 0, i, 3:7] * np.array([w, h, w, h])).astype("int")
                 face_found = True
@@ -135,46 +141,49 @@ def analyze_frame(img, user_gender):
             if face_crop.size > 0:
                 blob = cv2.dnn.blobFromImage(face_crop, 1.0, (227, 227), (78.4, 87.8, 114.9), swapRB=False)
                 
-                age_net.setInput(blob)
-                age_preds = age_net.forward()[0]
-                minor_prob = float(np.sum(age_preds[0:3]))
-                is_kid = bool(minor_prob > 0.80)
+                if not fast_mode:
+                    age_net.setInput(blob)
+                    age_preds = age_net.forward()[0]
+                    minor_prob = float(np.sum(age_preds[0:3]))
+                    is_kid = bool(minor_prob > 0.80)
                 
                 gender_net.setInput(blob)
                 gender_preds = gender_net.forward()[0]
                 male_conf = float(gender_preds[0])
                 female_conf = float(gender_preds[1])
                 
-                # Increased threshold to 85% to counter strong pink/colored room lighting bias
-                if male_conf > 0.85:
+                gender_thresh = 0.70 if fast_mode else 0.85
+                
+                if male_conf > gender_thresh:
                     predicted_gender = "male"
-                elif female_conf > 0.85:
+                elif female_conf > gender_thresh:
                     predicted_gender = "female"
                 else:
                     predicted_gender = user_gender
+        
+        if not fast_mode:
+            img_ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+            img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+            lower_ycrcb = np.array([0, 135, 85], dtype=np.uint8)
+            upper_ycrcb = np.array([255, 180, 135], dtype=np.uint8)
+            mask_ycrcb = cv2.inRange(img_ycrcb, lower_ycrcb, upper_ycrcb)
+
+            lower_hsv = np.array([0, 20, 70], dtype=np.uint8)
+            upper_hsv = np.array([25, 180, 255], dtype=np.uint8)
+            mask_hsv = cv2.inRange(img_hsv, lower_hsv, upper_hsv)
+
+            combined_skin_mask = cv2.bitwise_and(mask_ycrcb, mask_hsv)
             
-        img_ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
-        img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        lower_ycrcb = np.array([0, 135, 85], dtype=np.uint8)
-        upper_ycrcb = np.array([255, 180, 135], dtype=np.uint8)
-        mask_ycrcb = cv2.inRange(img_ycrcb, lower_ycrcb, upper_ycrcb)
-
-        lower_hsv = np.array([0, 20, 70], dtype=np.uint8)
-        upper_hsv = np.array([25, 180, 255], dtype=np.uint8)
-        mask_hsv = cv2.inRange(img_hsv, lower_hsv, upper_hsv)
-
-        combined_skin_mask = cv2.bitwise_and(mask_ycrcb, mask_hsv)
-        
-        if face_found:
-            mask_h = y2 - y1
-            neck_extension = int(y2 + (mask_h * 0.40))
-            combined_skin_mask[max(0, y1-30):min(h, neck_extension), max(0, x1-20):min(w, x2+20)] = 0 
-        
-        torso_mask = combined_skin_mask[int(h*0.40):h, 0:w]
-        if torso_mask.size > 0:
-            skin_ratio = np.sum(torso_mask > 0) / torso_mask.size
-            is_nudity = bool(skin_ratio > 0.62) 
+            if face_found:
+                mask_h = y2 - y1
+                neck_extension = int(y2 + (mask_h * 0.40))
+                combined_skin_mask[max(0, y1-30):min(h, neck_extension), max(0, x1-20):min(w, x2+20)] = 0 
+            
+            torso_mask = combined_skin_mask[int(h*0.40):h, 0:w]
+            if torso_mask.size > 0:
+                skin_ratio = np.sum(torso_mask > 0) / torso_mask.size
+                is_nudity = bool(skin_ratio > 0.62) 
         
         return face_found, is_kid, is_nudity, predicted_gender
     except Exception:
@@ -192,31 +201,60 @@ async def ai_background_worker():
                 continue
 
             async with ai_semaphore:
-                face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
+                face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender, False)
             
+            if client_ip not in client_history:
+                client_history[client_ip] = {
+                    'gender': deque(maxlen=10), 
+                    'face': deque(maxlen=10), 
+                    'nudity': deque(maxlen=10), 
+                    'kid': deque(maxlen=10)
+                }
+                
+            h = client_history[client_ip]
+            h['face'].append(face_found)
+            if predicted_gender != "unknown":
+                h['gender'].append(predicted_gender)
+            h['nudity'].append(is_nudity)
+            h['kid'].append(is_kid)
+            
+            total_frames = len(h['nudity'])
+            majority_thresh = (total_frames // 2) + 1
+            
+            cons_face = any(h['face']) if h['face'] else False
+            
+            cons_gender = user_gender
+            if h['gender']:
+                most_common_gen, gen_count = Counter(h['gender']).most_common(1)[0]
+                if gen_count >= (len(h['gender']) // 2) + 1:
+                    cons_gender = most_common_gen
+
+            cons_nudity = h['nudity'].count(True) >= majority_thresh
+            cons_kid = h['kid'].count(True) >= majority_thresh
+
             status_text = "No Face"
-            if is_nudity:
+            if cons_nudity:
                 status_text = "Nudity Detected"
-            elif face_found:
-                status_text = predicted_gender.capitalize()
-                if is_kid:
+            elif cons_face:
+                status_text = cons_gender.capitalize()
+                if cons_kid:
                     status_text += " (Minor)"
 
             try: await ws.send_json({"type": "ai_status", "payload": f"AI: {status_text}"})
             except Exception: pass
 
-            if is_nudity:
+            if cons_nudity:
                 img_b64 = compress_image_b64(img)
-                await execute_ban(client_ip, ws, room_id, "Explicit/Nudity content detected.", duration_hours=12, img_data=img_b64)
-            elif is_kid:
+                await ban_user(client_ip, "Explicit/Nudity content detected.", duration_hours=12, img_data=img_b64)
+            elif cons_kid:
                 img_b64 = compress_image_b64(img)
-                await execute_ban(client_ip, ws, room_id, "Minors are strictly prohibited.", duration_hours=87600, img_data=img_b64)
-            elif not face_found:
+                await ban_user(client_ip, "Minors are strictly prohibited.", duration_hours=87600, img_data=img_b64)
+            elif not cons_face:
                 try: await ws.send_json({"type": "warning", "payload": "⚠️ Warning: Face not visible! Please stay in the camera view."})
                 except Exception: pass
-            elif predicted_gender != user_gender and predicted_gender != "unknown":
+            elif cons_gender != user_gender and cons_gender != "unknown":
                 img_b64 = compress_image_b64(img)
-                await execute_ban(client_ip, ws, room_id, f"Gender Mismatch (Selected: {user_gender}, Detected: {predicted_gender})", duration_hours=12, img_data=img_b64)
+                await ban_user(client_ip, f"Gender Mismatch (Selected: {user_gender}, Detected: {cons_gender})", duration_hours=12, img_data=img_b64)
 
             del img
             gc.collect()
@@ -225,29 +263,6 @@ async def ai_background_worker():
             break
         except Exception:
             ai_task_queue.task_done()
-
-async def execute_ban(client_ip, ws, room_id, reason, duration_hours=12, img_data=None):
-    await ban_user(client_ip, reason, duration_hours, img_data)
-    try:
-        await asyncio.sleep(0.2)
-        await ws.close()
-    except Exception: pass
-
-    for chat_ws, ip in list(client_ips.items()):
-        if ip == client_ip:
-            try:
-                r_id = user_rooms.get(chat_ws)
-                if r_id and r_id in active_rooms:
-                    for client in active_rooms[r_id]:
-                        if client != chat_ws:
-                            await client.send_json({"type": "system", "payload": "Stranger was banned for safety violations."})
-                            await client.send_json({"type": "peer_disconnected"})
-                            await asyncio.sleep(0.2)
-                            await client.close()
-                    active_rooms.pop(r_id, None)
-                await asyncio.sleep(0.2)
-                await chat_ws.close()
-            except Exception: pass
 
 @app.on_event("startup")
 async def startup():
@@ -262,7 +277,8 @@ async def startup():
             except Exception: pass
             await conn.execute('CREATE TABLE IF NOT EXISTS ads (id SERIAL PRIMARY KEY, ad_content TEXT, is_active BOOLEAN DEFAULT TRUE)')
     except Exception: pass
-    for _ in range(4): workers.append(asyncio.create_task(ai_background_worker()))
+    
+    for _ in range(8): workers.append(asyncio.create_task(ai_background_worker()))
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -271,26 +287,35 @@ async def shutdown():
 
 async def is_banned(ip: str):
     if not db_pool: return None
-    try:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT reason FROM banned_ips WHERE ip = $1 AND is_banned = TRUE AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)", ip)
-            return row["reason"] if row else None
-    except Exception as e:
-        print(f"DB Ban Check Error: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT reason FROM banned_ips WHERE ip = $1 AND is_banned = TRUE AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)", ip)
+                return row["reason"] if row else None
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            if attempt == 2: print(f"DB Ban Check Error: {e}")
+            await asyncio.sleep(0.1)
+    return None
 
 async def ban_user(ip: str, reason: str, duration_hours: int = 12, img_data: str = None):
     if not db_pool: return
     expires = datetime.datetime.utcnow() + datetime.timedelta(hours=duration_hours)
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO banned_ips (ip, reason, is_banned, expires_at, image_data) 
-                VALUES ($1, $2, FALSE, $3, $4) 
-                ON CONFLICT (ip) DO UPDATE SET is_banned = FALSE, reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at, image_data = EXCLUDED.image_data
-            """, ip, reason, expires, img_data)
-    except Exception as e: 
-        print(f"DB Ban Insert Error: {e}")
+    for attempt in range(3):
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO banned_ips (ip, reason, is_banned, expires_at, image_data) 
+                    VALUES ($1, $2, FALSE, $3, $4) 
+                    ON CONFLICT (ip) DO UPDATE SET is_banned = FALSE, reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at, image_data = EXCLUDED.image_data
+                """, ip, reason, expires, img_data)
+                return
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            if attempt == 2: print(f"DB Ban Insert Error: {e}")
+            await asyncio.sleep(0.1)
 
 @app.get("/")
 async def serve_frontend():
@@ -360,6 +385,11 @@ async def websocket_chat(websocket: WebSocket, gender: str):
         client_ips[websocket] = client_ip
         await broadcast_active_count()
         user_gender = gender.lower()
+        
+        if user_gender not in ["male", "female"]:
+            await websocket.close()
+            return
+            
         is_verified = False
 
         init_data = await websocket.receive_json()
@@ -372,21 +402,10 @@ async def websocket_chat(websocket: WebSocket, gender: str):
             img = decode_base64_image(init_data.get("image", ""))
             
             async with ai_semaphore:
-                face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender)
+                face_found, is_kid, is_nudity, predicted_gender = await loop.run_in_executor(None, analyze_frame, img, user_gender, True)
                 
             if not face_found:
                 await websocket.send_json({"type": "error", "payload": "❌ No human face detected."})
-                await websocket.close()
-                return
-
-            if is_kid:
-                await ban_user(client_ip, "Minors are strictly prohibited.", duration_hours=87600, img_data=None)
-                await websocket.close()
-                return
-
-            if is_nudity:
-                img_b64 = compress_image_b64(img)
-                await ban_user(client_ip, "Explicit/Nudity content detected.", duration_hours=12, img_data=img_b64)
                 await websocket.close()
                 return
 
@@ -405,25 +424,42 @@ async def websocket_chat(websocket: WebSocket, gender: str):
         if not is_verified: return
 
         if user_gender == "male":
-            if waiting_females:
+            matched = False
+            while waiting_females:
                 partner_ws = waiting_females.pop(0)
-                room_id = str(uuid.uuid4())
-                active_rooms[room_id] = [websocket, partner_ws]
-                user_rooms[websocket] = user_rooms[partner_ws] = room_id
-                await websocket.send_json({"type": "match_start", "role": "initiator", "partner_gender": "Female"})
-                await partner_ws.send_json({"type": "match_start", "role": "receiver", "partner_gender": "Male"})
-            else:
+                try:
+                    room_id = str(uuid.uuid4())
+                    active_rooms[room_id] = [websocket, partner_ws]
+                    user_rooms[websocket] = user_rooms[partner_ws] = room_id
+                    await websocket.send_json({"type": "match_start", "role": "initiator", "partner_gender": "Female"})
+                    await partner_ws.send_json({"type": "match_start", "role": "receiver", "partner_gender": "Male"})
+                    matched = True
+                    break
+                except Exception:
+                    client_ips.pop(partner_ws, None)
+                    continue
+            
+            if not matched:
                 waiting_males.append(websocket)
-                await websocket.send_json({"type": "status", "payload": "Searching for a user..."})
-        else:
-            if waiting_males:
+                await websocket.send_json({"type": "status", "payload": "Searching for a female user..."})
+                
+        elif user_gender == "female":
+            matched = False
+            while waiting_males:
                 partner_ws = waiting_males.pop(0)
-                room_id = str(uuid.uuid4())
-                active_rooms[room_id] = [partner_ws, websocket]
-                user_rooms[websocket] = user_rooms[partner_ws] = room_id
-                await partner_ws.send_json({"type": "match_start", "role": "initiator", "partner_gender": "Female"})
-                await websocket.send_json({"type": "match_start", "role": "receiver", "partner_gender": "Male"})
-            else:
+                try:
+                    room_id = str(uuid.uuid4())
+                    active_rooms[room_id] = [partner_ws, websocket]
+                    user_rooms[websocket] = user_rooms[partner_ws] = room_id
+                    await partner_ws.send_json({"type": "match_start", "role": "initiator", "partner_gender": "Female"})
+                    await websocket.send_json({"type": "match_start", "role": "receiver", "partner_gender": "Male"})
+                    matched = True
+                    break
+                except Exception:
+                    client_ips.pop(partner_ws, None)
+                    continue
+                    
+            if not matched:
                 waiting_females.append(websocket)
                 await websocket.send_json({"type": "status", "payload": "Searching for a male user..."})
 
